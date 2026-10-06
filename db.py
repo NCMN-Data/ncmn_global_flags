@@ -1,7 +1,10 @@
-"""SQLite 저장소: 국가 설정(확대 이미지·필요 깃발 수·시도 목록)과 깃발 등록 정보."""
+"""SQLite 저장소: 국가 설정(확대 이미지·필요 깃발 수·시도 목록), 깃발 등록 정보, 회원."""
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -31,8 +34,11 @@ DEFAULT_PROVINCES = {
 
 REGISTRATION_FIELDS = [
     "iso3", "x", "y", "province", "flag_count", "city", "address", "organization",
-    "contact_name", "contact_phone", "email", "registrant_name", "photo_path",
+    "contact_name", "contact_phone", "email", "registrant_name", "photo_path", "user_id",
 ]
+
+USER_FIELDS = ["branch", "affiliation", "name", "email", "phone", "purpose"]
+PASSWORD_ITERATIONS = 200_000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS countries (
@@ -57,9 +63,23 @@ CREATE TABLE IF NOT EXISTS registrations (
     email TEXT,
     registrant_name TEXT,
     photo_path TEXT,
+    user_id INTEGER,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_registrations_iso3 ON registrations (iso3);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch TEXT NOT NULL,
+    affiliation TEXT NOT NULL,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    phone TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+);
 """
 
 
@@ -79,6 +99,10 @@ def init_db():
         directory.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # 회원 기능 이전에 만들어진 DB에는 user_id 열이 없다
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(registrations)")}
+        if "user_id" not in columns:
+            conn.execute("ALTER TABLE registrations ADD COLUMN user_id INTEGER")
 
 
 def _now():
@@ -216,6 +240,97 @@ def list_registrations(iso3=None):
         params = (iso3,)
     with connect() as conn:
         return pd.read_sql_query(query + " ORDER BY id", conn, params=params)
+
+
+# ---------------------------------------------------------------- 회원
+
+
+def _hash_password(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PASSWORD_ITERATIONS)
+    return f"{salt.hex()}${digest.hex()}"
+
+
+def _verify_password(password, stored):
+    salt_hex = stored.partition("$")[0]
+    return hmac.compare_digest(_hash_password(password, bytes.fromhex(salt_hex)), stored)
+
+
+def request_signup(password, **fields):
+    """회원가입 요청을 승인 대기로 저장한다.
+
+    이미 같은 이메일이 대기·승인 상태면 그 상태("pending"/"approved")를 돌려주고,
+    거절된 요청은 새 내용으로 다시 접수한다. 접수되면 None.
+    """
+    values = {field: fields[field].strip() for field in USER_FIELDS}
+    values["email"] = values["email"].lower()
+    values["password_hash"] = _hash_password(password)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, status FROM users WHERE email = ?", (values["email"],)
+        ).fetchone()
+        if row and row["status"] != "rejected":
+            return row["status"]
+        if row:
+            assignments = ", ".join(f"{column} = ?" for column in values)
+            conn.execute(
+                f"UPDATE users SET {assignments}, status = 'pending', created_at = ?, "
+                "decided_at = NULL WHERE id = ?",
+                (*values.values(), _now(), row["id"]),
+            )
+        else:
+            columns = ", ".join(values)
+            placeholders = ", ".join("?" for _ in values)
+            conn.execute(
+                f"INSERT INTO users ({columns}, created_at) VALUES ({placeholders}, ?)",
+                (*values.values(), _now()),
+            )
+    return None
+
+
+def authenticate(email, password):
+    """(회원, None) 또는 (None, 사유)를 돌려준다. 사유: invalid / pending / rejected."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE email = ?", (email.strip().lower(),)
+        ).fetchone()
+    if row is None or not _verify_password(password, row["password_hash"]):
+        return None, "invalid"
+    if row["status"] != "approved":
+        return None, row["status"]
+    return dict(row), None
+
+
+def get_user(user_id):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_users():
+    columns = ", ".join(["id", *USER_FIELDS, "status", "created_at", "decided_at"])
+    with connect() as conn:
+        return pd.read_sql_query(f"SELECT {columns} FROM users ORDER BY id", conn)
+
+
+def count_users(status):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM users WHERE status = ?", (status,)
+        ).fetchone()[0]
+
+
+def set_user_status(user_id, status):
+    with connect() as conn:
+        conn.execute(
+            "UPDATE users SET status = ?, decided_at = ? WHERE id = ?",
+            (status, _now(), user_id),
+        )
+
+
+def delete_user(user_id):
+    with connect() as conn:
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
 
 # ---------------------------------------------------------------- 합계

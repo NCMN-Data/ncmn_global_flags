@@ -32,6 +32,18 @@ PIN_COLOR = "#c8372d"
 PIN_PENDING_COLOR = "#256abf"
 
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
+MIN_PASSWORD_LENGTH = 8
+ACCOUNT_PANES = ["로그인", "회원가입", "관리자"]
+LOGIN_ERRORS = {
+    "invalid": "이메일 또는 비밀번호가 올바르지 않습니다.",
+    "pending": "가입 요청이 아직 승인 대기 중입니다. 관리자 승인 후 로그인할 수 있습니다.",
+    "rejected": "가입 요청이 거절되었습니다. 관리자에게 문의하거나 다시 가입을 요청하세요.",
+}
+SIGNUP_ERRORS = {
+    "pending": "이미 가입 요청이 접수되어 승인 대기 중인 이메일입니다.",
+    "approved": "이미 가입된 이메일입니다. 로그인해 주세요.",
+}
+USER_STATUS_LABELS = {"pending": "승인 대기", "approved": "승인됨", "rejected": "거절됨"}
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 PAGE_CSS = """
@@ -58,6 +70,9 @@ PAGE_CSS = """
 def init_state():
     defaults = {
         "admin": False,
+        "user_id": None,
+        "view": None,
+        "menu_nonce": 0,
         "country": None,
         "map_nonce": 0,
         "click_nonce": 0,
@@ -75,34 +90,163 @@ def go_country(iso3):
 
 
 def go_world():
+    st.session_state.view = None
     st.session_state.country = None
     st.session_state.pending_point = None
     # 지도·선택 위젯의 키를 바꿔 이전 선택이 남아 다시 이동하는 일을 막는다
     st.session_state.map_nonce += 1
 
 
+def close_account_menu():
+    # 팝오버는 재실행 뒤에도 열려 있으므로 키를 바꿔 닫는다
+    st.session_state.menu_nonce += 1
+
+
+def go_members():
+    st.session_state.view = "members"
+    close_account_menu()
+
+
 def leave_admin():
     st.session_state.admin = False
+    st.session_state.view = None
+    close_account_menu()
 
 
-def render_mode_control():
+def logout():
+    st.session_state.user_id = None
+    st.session_state.pending_point = None
+    close_account_menu()
+
+
+# ---------------------------------------------------------------- 계정
+
+
+def current_user():
+    """로그인한 회원. 승인이 취소되었거나 삭제된 계정은 자동으로 로그아웃된다."""
+    if st.session_state.user_id is None:
+        return None
+    user = db.get_user(st.session_state.user_id)
+    if user is None or user["status"] != "approved":
+        logout()
+        return None
+    return user
+
+
+def render_login_form():
+    with st.form("login", border=False):
+        email = st.text_input("이메일")
+        password = st.text_input("비밀번호", type="password")
+        submitted = st.form_submit_button("로그인", type="primary", width="stretch")
+    if not submitted:
+        return
+    user, error = db.authenticate(email, password)
+    if error:
+        st.error(LOGIN_ERRORS[error])
+        return
+    st.session_state.user_id = user["id"]
+    st.rerun()
+
+
+def render_signup_form():
+    if st.session_state.get("signup_done"):
+        st.success("회원가입 요청이 접수되었습니다. 관리자가 승인하면 로그인할 수 있습니다.")
+        return
+    with st.form("signup", border=False):
+        st.caption("가입을 요청하면 관리자 승인 후 로그인할 수 있습니다. 모든 항목은 필수입니다.")
+        left, right = st.columns(2)
+        fields = {
+            "branch": left.text_input("지부"),
+            "affiliation": right.text_input("소속"),
+            "name": left.text_input("이름"),
+            "phone": right.text_input("연락처"),
+            "email": st.text_input("이메일"),
+            "purpose": st.text_area("사용목적", height=90),
+        }
+        left, right = st.columns(2)
+        password = left.text_input(f"비밀번호 ({MIN_PASSWORD_LENGTH}자 이상)", type="password")
+        password_confirm = right.text_input("비밀번호 확인", type="password")
+        submitted = st.form_submit_button("회원가입 요청", type="primary", width="stretch")
+    if not submitted:
+        return
+    errors = []
+    if not all(value.strip() for value in fields.values()):
+        errors.append("모든 항목을 입력하세요.")
+    if fields["email"].strip() and not EMAIL_PATTERN.match(fields["email"].strip()):
+        errors.append("이메일 형식이 올바르지 않습니다.")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        errors.append(f"비밀번호는 {MIN_PASSWORD_LENGTH}자 이상이어야 합니다.")
+    elif password != password_confirm:
+        errors.append("비밀번호 확인이 일치하지 않습니다.")
+    if not errors:
+        existing = db.request_signup(password, **fields)
+        if existing:
+            errors.append(SIGNUP_ERRORS[existing])
+    if errors:
+        for message in errors:
+            st.error(message)
+        return
+    st.session_state.signup_done = True
+    st.rerun(scope="fragment")
+
+
+def render_admin_login_form():
+    with st.form("admin_login", border=False):
+        password = st.text_input("관리자 비밀번호", type="password")
+        submitted = st.form_submit_button("관리자 모드로 전환", type="primary", width="stretch")
+    if not submitted:
+        return
+    if not hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode()):
+        st.error("비밀번호가 올바르지 않습니다.")
+        return
+    st.session_state.admin = True
+    st.session_state.pending_point = None
+    st.rerun()
+
+
+@st.dialog("계정")
+def account_dialog():
+    pane = st.radio(
+        "계정", ACCOUNT_PANES, horizontal=True, label_visibility="collapsed", key="account_pane"
+    )
+    if pane == "로그인":
+        render_login_form()
+    elif pane == "회원가입":
+        render_signup_form()
+    else:
+        render_admin_login_form()
+
+
+def open_account_dialog(pane="로그인"):
+    st.session_state.account_pane = pane
+    st.session_state.signup_done = False
+    account_dialog()
+
+
+def render_account_control(user):
+    menu_key = f"account_menu_{st.session_state.menu_nonce}"
     if st.session_state.admin:
-        with st.popover("🔑 관리자 모드", width="stretch"):
-            st.caption("국가별 확대 이미지·필요 깃발 수·시도 목록을 관리합니다.")
+        pending = db.count_users("pending")
+        label = f"🔑 관리자 · 대기 {pending}" if pending else "🔑 관리자 모드"
+        with st.popover(label, width="stretch", key=menu_key):
+            st.caption("국가별 확대 이미지·필요 깃발 수·시도 목록과 회원 가입 요청을 관리합니다.")
             if ADMIN_PASSWORD == "admin":
                 st.warning("기본 비밀번호를 사용 중입니다. NCMN_ADMIN_PASSWORD 환경변수로 변경하세요.")
+            st.button(
+                f"회원 관리 (승인 대기 {pending}건)" if pending else "회원 관리",
+                on_click=go_members,
+                type="primary" if pending else "secondary",
+                width="stretch",
+            )
             st.button("사용자 모드로 전환", on_click=leave_admin, width="stretch")
         return
-    with st.popover("👤 사용자 모드", width="stretch"):
-        with st.form("admin_login", border=False):
-            password = st.text_input("관리자 비밀번호", type="password")
-            submitted = st.form_submit_button("관리자 모드로 전환", width="stretch")
-        if submitted:
-            if hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode()):
-                st.session_state.admin = True
-                st.session_state.pending_point = None
-                st.rerun()
-            st.error("비밀번호가 올바르지 않습니다.")
+    if user:
+        with st.popover(f"👤 {user['name']}", width="stretch", key=menu_key):
+            st.text(f"{user['branch']} · {user['affiliation']}\n{user['email']}")
+            st.button("로그아웃", on_click=logout, width="stretch")
+        return
+    if st.button("👤 로그인 · 회원가입", key="open_account", width="stretch"):
+        open_account_dialog()
 
 
 # ---------------------------------------------------------------- 세계지도
@@ -227,7 +371,7 @@ def world_table(totals):
     )[["국가", "필요 깃발 수", "등록 깃발 수", "등록 건수", "달성률"]]
 
 
-def render_world():
+def render_world(user):
     admin = st.session_state.admin
     nonce = st.session_state.map_nonce
     totals = db.country_totals()
@@ -236,7 +380,7 @@ def render_world():
     flagged_countries = int((totals["flags"] > 0).sum())
 
     title_col, summary_col, select_col, mode_col = st.columns(
-        [2.4, 4, 2.6, 1.6], vertical_alignment="center"
+        [2.4, 3.8, 2.6, 1.8], vertical_alignment="center"
     )
     title_col.markdown('<div class="app-title">🚩 NCMN Global Flags</div>', unsafe_allow_html=True)
     summary_col.markdown(
@@ -255,7 +399,7 @@ def render_world():
             key=f"country_select_{nonce}",
         )
     with mode_col:
-        render_mode_control()
+        render_account_control(user)
     if selected:
         go_country(selected)
         st.rerun()
@@ -341,10 +485,10 @@ def draw_pins(base, registrations, pending=None):
     return image
 
 
-def render_country_image(iso3, country, registrations, admin):
+def render_country_image(iso3, country, registrations, can_register):
     image_path = db.resolve_path(country["image_path"])
     if image_path is None:
-        if admin:
+        if st.session_state.admin:
             st.info("확대 이미지가 아직 없습니다. 오른쪽 국가 설정에서 이미지를 추가하세요.")
         else:
             st.info(
@@ -353,7 +497,7 @@ def render_country_image(iso3, country, registrations, admin):
             )
         return
     annotated = draw_pins(load_image(str(image_path)), registrations, st.session_state.pending_point)
-    if admin:
+    if not can_register:
         st.image(annotated, width="stretch")
         st.caption("빨간 핀의 숫자는 해당 위치에 등록된 깃발 수입니다.")
         return
@@ -397,8 +541,16 @@ def render_admin_settings(iso3, country):
         st.rerun()
 
 
-def render_registration_form(iso3, country):
+def render_registration_form(iso3, country, user):
     st.subheader("깃발 등록")
+    if user is None:
+        st.info("깃발 등록은 승인된 회원만 할 수 있습니다. 로그인하거나 회원가입을 요청하세요.")
+        login_col, signup_col = st.columns(2)
+        if login_col.button("로그인", key="prompt_login", type="primary", width="stretch"):
+            open_account_dialog("로그인")
+        if signup_col.button("회원가입 요청", key="prompt_signup", width="stretch"):
+            open_account_dialog("회원가입")
+        return
     pending = st.session_state.pending_point
     if not country["image_path"]:
         st.caption("확대 이미지가 등록된 뒤에 깃발을 등록할 수 있습니다.")
@@ -421,7 +573,7 @@ def render_registration_form(iso3, country):
         contact_name = left.text_input("현지 연락자명")
         contact_phone = right.text_input("연락처")
         email = left.text_input("이메일주소")
-        registrant_name = right.text_input("등록자명 *")
+        registrant_name = right.text_input("등록자명 *", value=user["name"])
         photo = st.file_uploader("등록 이미지", type=IMAGE_TYPES)
         submit_col, cancel_col = st.columns(2)
         submitted = submit_col.form_submit_button("등록", type="primary", width="stretch")
@@ -449,7 +601,7 @@ def render_registration_form(iso3, country):
         iso3, pending[0], pending[1], province, flag_count, photo=photo,
         city=city.strip(), address=address.strip(), organization=organization.strip(),
         contact_name=contact_name.strip(), contact_phone=contact_phone.strip(),
-        email=email.strip(), registrant_name=registrant_name.strip(),
+        email=email.strip(), registrant_name=registrant_name.strip(), user_id=user["id"],
     )
     st.session_state.pending_point = None
     st.session_state.click_nonce += 1
@@ -472,10 +624,13 @@ def render_province_table(iso3):
     st.dataframe(table, hide_index=True, width="stretch", height=35 * (len(table) + 1) + 3)
 
 
-def render_registrations(registrations, admin):
+def render_registrations(registrations, admin, show_details):
     st.subheader(f"등록 목록 ({len(registrations)}건)")
     if registrations.empty:
         st.caption("아직 등록된 깃발이 없습니다.")
+        return
+    if not show_details:
+        st.caption("등록 상세 정보(연락처 포함)는 로그인한 회원만 볼 수 있습니다.")
         return
     columns = {
         "id": "번호", "province": "시도", "city": "도시명", "address": "주소",
@@ -506,19 +661,19 @@ def render_registrations(registrations, admin):
                 with info_col.popover("삭제"):
                     st.write("이 등록 정보와 이미지를 삭제합니다. 되돌릴 수 없습니다.")
                     if st.button("삭제 확인", key=f"delete_{row.id}", type="primary"):
-                        db.delete_registration(row.id)
+                        db.delete_registration(int(row.id))
                         st.toast(f"#{row.id} 등록을 삭제했습니다.")
                         st.rerun()
 
 
-def render_country(iso3):
+def render_country(iso3, user):
     admin = st.session_state.admin
     country = db.get_country(iso3)
     registrations = db.list_registrations(iso3)
     registered = int(registrations["flag_count"].sum())
     required = int(country["required_flags"])
 
-    back_col, title_col, mode_col = st.columns([1.4, 7, 1.6], vertical_alignment="center")
+    back_col, title_col, mode_col = st.columns([1.4, 6.8, 1.8], vertical_alignment="center")
     back_col.button("← 세계지도", on_click=go_world, width="stretch")
     title_col.markdown(
         f'<div class="app-title">🚩 {COUNTRY_NAMES[iso3]} '
@@ -526,7 +681,7 @@ def render_country(iso3):
         unsafe_allow_html=True,
     )
     with mode_col:
-        render_mode_control()
+        render_account_control(user)
 
     metric_cols = st.columns(4)
     metric_cols[0].metric("필요 깃발 수", f"{required:,}")
@@ -536,15 +691,73 @@ def render_country(iso3):
 
     image_col, side_col = st.columns([3, 2], gap="medium")
     with image_col:
-        render_country_image(iso3, country, registrations, admin)
+        render_country_image(iso3, country, registrations, can_register=bool(user) and not admin)
     with side_col:
         if admin:
             render_admin_settings(iso3, country)
         else:
-            render_registration_form(iso3, country)
+            render_registration_form(iso3, country, user)
         render_province_table(iso3)
 
-    render_registrations(registrations, admin)
+    render_registrations(registrations, admin, show_details=admin or bool(user))
+
+
+# ---------------------------------------------------------------- 회원 관리 (관리자)
+
+
+def render_members():
+    back_col, title_col, mode_col = st.columns([1.4, 6.8, 1.8], vertical_alignment="center")
+    back_col.button("← 세계지도", on_click=go_world, width="stretch")
+    title_col.markdown('<div class="app-title">🔑 회원 관리</div>', unsafe_allow_html=True)
+    with mode_col:
+        render_account_control(None)
+
+    users = db.list_users()
+    counts = users["status"].value_counts()
+    status = st.radio(
+        "상태",
+        list(USER_STATUS_LABELS),
+        horizontal=True,
+        format_func=lambda value: f"{USER_STATUS_LABELS[value]} ({counts.get(value, 0)})",
+        label_visibility="collapsed",
+        key="members_status",
+    )
+    selected = users[users["status"] == status]
+    if selected.empty:
+        st.caption(f"{USER_STATUS_LABELS[status]} 상태인 회원이 없습니다.")
+        return
+    for row in selected.itertuples():
+        with st.container(border=True):
+            info_col, action_col = st.columns([5, 1.2], vertical_alignment="center")
+            info_col.text(
+                f"{row.name} · {row.branch} · {row.affiliation}\n"
+                f"{row.email} · {row.phone}\n"
+                f"사용목적: {row.purpose}"
+            )
+            decided = f" · 처리일시 {row.decided_at}" if row.decided_at else ""
+            info_col.caption(f"요청일시 {row.created_at}{decided}")
+            if status != "approved":
+                action_col.button(
+                    "승인", key=f"approve_{row.id}", type="primary", width="stretch",
+                    on_click=db.set_user_status, args=(int(row.id), "approved"),
+                )
+            if status == "pending":
+                action_col.button(
+                    "거절", key=f"reject_{row.id}", width="stretch",
+                    on_click=db.set_user_status, args=(int(row.id), "rejected"),
+                )
+            if status == "approved":
+                action_col.button(
+                    "승인 취소", key=f"revoke_{row.id}", width="stretch",
+                    on_click=db.set_user_status, args=(int(row.id), "rejected"),
+                )
+            if status != "pending":
+                with action_col.popover("삭제", width="stretch"):
+                    st.write("이 회원 계정을 삭제합니다. 되돌릴 수 없습니다.")
+                    st.button(
+                        "삭제 확인", key=f"delete_user_{row.id}", type="primary",
+                        on_click=db.delete_user, args=(int(row.id),),
+                    )
 
 
 def main():
@@ -557,10 +770,13 @@ def main():
     st.markdown(PAGE_CSS, unsafe_allow_html=True)
     db.init_db()
     init_state()
-    if st.session_state.country:
-        render_country(st.session_state.country)
+    user = current_user()
+    if st.session_state.admin and st.session_state.view == "members":
+        render_members()
+    elif st.session_state.country:
+        render_country(st.session_state.country, user)
     else:
-        render_world()
+        render_world(user)
 
 
 main()
