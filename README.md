@@ -1,0 +1,1 @@
+# ncmn_global_flags
