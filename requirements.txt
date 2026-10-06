@@ -1,0 +1,5 @@
+streamlit>=1.50
+plotly>=6.0
+pandas>=2.0
+pillow>=10.1
+streamlit-image-coordinates>=0.4.1
